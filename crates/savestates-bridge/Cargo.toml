@@ -1,0 +1,11 @@
+[package]
+name = "savestates-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+savestates-core = { path = "../savestates-core" }

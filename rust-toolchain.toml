@@ -1,0 +1,6 @@
+# eframe/egui 0.37 and sysinfo 0.39 require rustc 1.95. Pinned per project so the
+# system-wide default toolchain is left alone.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

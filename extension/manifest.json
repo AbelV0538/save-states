@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Save States Companion",
+  "version": "0.1.0",
+  "description": "Lets the Save States desktop app save and restore the tabs open in this Chrome profile.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA8gVxa1KmJowoH0/d9AkXVwtJrALuC0brSad7bVJSYdhb69w7vi3P8ypbUJEDkKnLuh2ZvZABIx0OO5xAeUiJgYh0q2mgcHJxdpqC81iLWbK9Kg8g7AwU/+ZQoDh2uhGiRLYqz/pnxgEMRkS8gC34NeLxzxk6RRrGQt7iHA+625CFljMjwbUmpfkKj5alclnYcAI4sEzAj9U/4Vq8JraSx88YKMUieF6+OJnl6f9mZPJErN4MXwt0dEZOgIQpCwoHQuqsC2cTZqnHd7pRb1zHX+hWUiCscArbthSSn60+nv29JrkCXRxsj1V61Jx9Ofdf7hLzx7E6Jwmgnc2IpSptYQIDAQAB",
+  "minimum_chrome_version": "116",
+  "background": { "service_worker": "sw.js" },
+  "permissions": ["tabs", "tabGroups", "nativeMessaging", "alarms", "storage"]
+}

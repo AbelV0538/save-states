@@ -129,7 +129,7 @@ fn quarantine(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CapturedItem, ProcessWindow, StoredItem, Thumbnail};
+    use crate::model::{CapturedItem, ProcessWindow, StoredItem, Thumbnail, VsCodeWindow};
 
     fn temp_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("savestates-test-{}-{name}", std::process::id()));
@@ -208,6 +208,27 @@ mod tests {
         assert!(text.contains("hologram"), "unknown item kind was dropped");
         assert!(text.contains("future_field"), "unknown field was dropped");
         assert!(text.contains("\"version\": 7"), "version marker was downgraded");
+    }
+
+    #[test]
+    fn vscode_items_round_trip() {
+        let path = temp_path("vscode");
+        let (mut store, _) = Store::open(path.clone());
+        let mut state = sample_state("Code");
+        state.items = vec![StoredItem::Known(CapturedItem::VsCode(VsCodeWindow {
+            exe: r"C:\Programs\Microsoft VS Code\Code.exe".into(),
+            product: "Visual Studio Code".into(),
+            folder: Some("file:///c%3A/src/app".into()),
+            ..Default::default()
+        }))];
+        let id = state.id;
+        store.insert(state).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""kind": "vs_code""#), "{text}");
+        let (reloaded, _) = Store::open(path);
+        let items: Vec<_> = reloaded.get(id).unwrap().known_items().collect();
+        assert!(matches!(items[..], [CapturedItem::VsCode(v)] if v.folder.as_deref() == Some("file:///c%3A/src/app")));
     }
 
     #[test]

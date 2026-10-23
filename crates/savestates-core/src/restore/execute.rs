@@ -5,6 +5,7 @@
 //! launched anything, never by PID: launchers hand off to other processes, and
 //! single-instance apps (VS Code, Chrome) open the new window in the old process.
 //! A window that shows up untitled is simply not a candidate until it has a title.
+//! VS Code windows are told apart by the folder or workspace name in their titles.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -20,14 +21,19 @@ use crate::chrome::profiles::find_chrome_exe;
 use crate::chrome::{ChromeEnv, InstanceMap};
 use crate::desktops;
 use crate::model::{CaptureScope, ChromeTab, Geometry, TabGroup};
+use crate::vscode;
 use crate::win::enumerate::{self, LiveWindow};
 use crate::win::launch::{self, LaunchError, quote_arg};
 use crate::win::process;
 
 const TICK: Duration = Duration::from_millis(150);
 const CHROME_WINDOW_TIMEOUT: Duration = Duration::from_secs(12);
+/// Long enough for VS Code to start cold and show the folder name in its title.
+const VSCODE_WINDOW_TIMEOUT: Duration = Duration::from_secs(20);
 const APP_WINDOW_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an app whose last window we closed gets to finish quitting.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stay well under the 32,767-character CreateProcess limit.
 const MAX_CMDLINE: usize = 30_000;
 
@@ -82,7 +88,7 @@ pub fn execute(
     let mut pending: Vec<Pending<'_>> = Vec::new();
     for unit in &plan.launches {
         let expect = match &unit.action {
-            LaunchAction::Chrome { .. } => continue,
+            LaunchAction::Chrome { .. } | LaunchAction::VsCode { .. } => continue,
             LaunchAction::Process { exe, args, cwd } => {
                 launch::spawn(exe, args, cwd.as_deref()).map(|_| Expect::Exe(file_name(exe)))
             }
@@ -156,6 +162,100 @@ pub fn execute(
         }
     }
 
+    // VS Code: also one window at a time, which lets the first launch finish starting the
+    // editor so later ones are handed to it instead of racing to become its main instance.
+    // Empty windows and untitled workspaces have generic titles and can only be told apart
+    // by when they appear, so they go last.
+    let mut code_units: Vec<&LaunchUnit> =
+        plan.launches.iter().filter(|u| matches!(u.action, LaunchAction::VsCode { .. })).collect();
+    code_units.sort_by_key(|u| vscode_label(u).is_empty());
+    if close_extras && report.closed > 0 && !code_units.is_empty() {
+        let exe_names: Vec<String> = code_units
+            .iter()
+            .filter_map(|u| match &u.action {
+                LaunchAction::VsCode { exe, .. } => Some(file_name(exe)),
+                _ => None,
+            })
+            .collect();
+        wait_for_quitting_apps(plan, &exe_names);
+    }
+    // What the labeled units' windows will show, to tell them from windows VS Code opens on its own.
+    let unit_labels: Vec<(String, bool)> = code_units
+        .iter()
+        .filter_map(|u| match &u.action {
+            LaunchAction::VsCode { folder, workspace, .. } => {
+                Some((vscode_label(u), folder.is_none() && workspace.is_some())).filter(|(l, _)| !l.is_empty())
+            }
+            _ => None,
+        })
+        .collect();
+    let shows_a_unit =
+        |w: &LiveWindow| unit_labels.iter().any(|(l, ws)| vscode::title_position(&w.title, l, *ws).is_some());
+    let mut code_exes: Vec<String> = Vec::new();
+    for unit in code_units {
+        let LaunchAction::VsCode { exe, user_data_dir, folder, workspace } = &unit.action else { continue };
+        done += 1;
+        on_progress(done, total, &unit.label);
+        let exe_name = file_name(exe);
+        if !code_exes.contains(&exe_name) {
+            code_exes.push(exe_name.clone());
+        }
+        let label = vscode_label(unit);
+        let is_workspace = folder.is_none() && workspace.is_some();
+        let shows_target =
+            |w: &LiveWindow| w.exe_is(&exe_name) && vscode::title_position(&w.title, &label, is_workspace).is_some();
+        // Empty windows and untitled workspaces can only be told apart from the folder windows.
+        let is_ours = |w: &LiveWindow| {
+            if label.is_empty() { w.exe_is(&exe_name) && !shows_a_unit(w) } else { shows_target(w) }
+        };
+
+        // The window may be open already. Starting the editor for an earlier unit makes VS Code
+        // reopen its untitled workspaces and windows with unsaved files, and with
+        // `window.restoreWindows: preserve`, the rest of its last session.
+        let mut found = new_windows(&baseline, &assigned).into_iter().find(|w| is_ours(w)).map(|w| w.hwnd);
+        if found.is_none() {
+            let target = folder.as_deref().or(workspace.as_deref());
+            if target.and_then(vscode::local_path).is_some_and(|p| !p.exists()) {
+                report.failed.push((unit.label.clone(), LaunchError::NotFound.to_string()));
+                continue;
+            }
+            let before: HashSet<isize> = enumerate::raw_top_level_windows().iter().map(|h| h.0 as isize).collect();
+            let args = vscode::launch_args(user_data_dir.as_deref(), folder.as_deref(), workspace.as_deref());
+            if let Err(e) = launch::spawn(exe, &args, None) {
+                report.failed.push((unit.label.clone(), e.to_string()));
+                continue;
+            }
+            let deadline = Instant::now() + VSCODE_WINDOW_TIMEOUT;
+            while found.is_none() && Instant::now() < deadline {
+                thread::sleep(TICK);
+                for w in new_windows(&baseline, &assigned) {
+                    let ours = is_ours(&w) && (!label.is_empty() || !before.contains(&w.hwnd));
+                    if ours && found.is_none() {
+                        found = Some(w.hwnd);
+                    } else {
+                        service(&mut pending, &w, &mut assigned, &placer, &mut placed);
+                    }
+                }
+            }
+        }
+        let Some(hwnd) = found else {
+            report.no_window.push(unit.label.clone());
+            continue;
+        };
+        assigned.insert(hwnd);
+        if let Some((_, geom)) = unit.windows.first() {
+            placer.place(hwnd, geom);
+            placed.push((hwnd, geom.clone()));
+        }
+        report.opened.push(unit.label.clone());
+    }
+    let reopened = new_windows(&baseline, &assigned).iter().filter(|w| code_exes.iter().any(|n| w.exe_is(n))).count();
+    if reopened > 0 {
+        report.notes.push(format!(
+            "VS Code also reopened {reopened} window(s) of its own (untitled workspaces, unsaved files, or its last session)."
+        ));
+    }
+
     while pending.iter().any(|p| !p.remaining.is_empty()) && Instant::now() < apps_deadline {
         thread::sleep(TICK);
         for w in new_windows(&baseline, &assigned) {
@@ -201,6 +301,35 @@ fn close_windows(plan: &RestorePlan, report: &mut RestoreReport) {
     report.closed = plan.extras.len() - remaining.len();
     // Still open = the app asked about unsaved work, or ignored us. Never forced.
     report.declined_close = remaining.iter().map(|e| e.label.clone()).collect();
+}
+
+/// Closing an app's last window can make it quit, and while it does it may accept a new
+/// launch and drop it (VS Code does). Give processes of `exe_names` whose windows we just
+/// closed, and that have none left, time to exit.
+fn wait_for_quitting_apps(plan: &RestorePlan, exe_names: &[String]) {
+    let with_windows: HashSet<u32> = enumerate::app_windows(std::process::id()).iter().map(|w| w.pid).collect();
+    let quitting: HashSet<u32> = plan
+        .extras
+        .iter()
+        .map(|e| e.pid)
+        .filter(|pid| !with_windows.contains(pid))
+        .filter(|&pid| {
+            process::exe_path(pid).is_some_and(|p| exe_names.iter().any(|n| file_name(&p).eq_ignore_ascii_case(n)))
+        })
+        .collect();
+    let deadline = Instant::now() + QUIT_TIMEOUT;
+    for pid in quitting {
+        if !process::wait_for_exit(pid, deadline.saturating_duration_since(Instant::now())) {
+            warn!(pid, "app still running after its windows were closed");
+        }
+    }
+}
+
+fn vscode_label(unit: &LaunchUnit) -> String {
+    match &unit.action {
+        LaunchAction::VsCode { folder, workspace, .. } => vscode::root_label(folder.as_deref(), workspace.as_deref()),
+        _ => String::new(),
+    }
 }
 
 /// App windows that appeared since the baseline and haven't been claimed yet.

@@ -77,6 +77,7 @@ impl SaveState {
                     s.chrome_tabs += w.tabs.len();
                 }
                 CapturedItem::Explorer(_) => s.folders += 1,
+                CapturedItem::VsCode(_) => s.vscode_windows += 1,
                 CapturedItem::Uwp(_) | CapturedItem::Process(_) => s.apps += 1,
             }
         }
@@ -90,6 +91,7 @@ pub struct ItemSummary {
     pub folders: usize,
     pub chrome_windows: usize,
     pub chrome_tabs: usize,
+    pub vscode_windows: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -124,6 +126,7 @@ pub enum CapturedItem {
     Chrome(ChromeWindow),
     Uwp(UwpWindow),
     Explorer(ExplorerWindow),
+    VsCode(VsCodeWindow),
     Process(ProcessWindow),
 }
 
@@ -133,6 +136,7 @@ impl CapturedItem {
             CapturedItem::Chrome(w) => &w.geometry,
             CapturedItem::Uwp(w) => &w.geometry,
             CapturedItem::Explorer(w) => &w.geometry,
+            CapturedItem::VsCode(w) => &w.geometry,
             CapturedItem::Process(w) => &w.geometry,
         }
     }
@@ -142,6 +146,7 @@ impl CapturedItem {
             CapturedItem::Chrome(w) => &mut w.geometry,
             CapturedItem::Uwp(w) => &mut w.geometry,
             CapturedItem::Explorer(w) => &mut w.geometry,
+            CapturedItem::VsCode(w) => &mut w.geometry,
             CapturedItem::Process(w) => &mut w.geometry,
         }
     }
@@ -163,6 +168,14 @@ impl CapturedItem {
                 Some(f) => format!("Explorer - {f}"),
                 None => "Explorer".to_string(),
             },
+            CapturedItem::VsCode(w) => {
+                let product = if w.product.is_empty() { "VS Code" } else { w.product.as_str() };
+                match (&w.folder, &w.workspace) {
+                    (Some(f), _) => format!("{product} - {}", crate::vscode::display_location(f)),
+                    (None, Some(ws)) => format!("{product} - {} (workspace)", crate::vscode::display_location(ws)),
+                    (None, None) => format!("{product} (empty window)"),
+                }
+            }
             CapturedItem::Process(w) => {
                 let exe = w.exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 if w.title.is_empty() { exe } else { format!("{} ({exe})", w.title) }
@@ -260,6 +273,24 @@ pub struct UwpWindow {
 pub struct ExplorerWindow {
     /// Parsing names: plain paths, or `::{GUID}` shell locations like This PC. One per tab.
     pub folders: Vec<String>,
+    pub title: String,
+    pub geometry: Geometry,
+}
+
+/// A window of VS Code or an editor built from it (Insiders, VSCodium, Cursor, ...).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VsCodeWindow {
+    /// The editor's executable at capture time (`Code.exe`, ...).
+    pub exe: PathBuf,
+    /// The product's display name ("Visual Studio Code"), for the UI.
+    pub product: String,
+    /// Set only when the editor was started with `--user-data-dir`; passed back on restore.
+    pub user_data_dir: Option<PathBuf>,
+    /// The open folder's URI as VS Code reports it (`file:///c%3A/...`, `vscode-remote://...`).
+    pub folder: Option<String>,
+    /// The open workspace file's URI. Neither this nor `folder` set means an empty window.
+    pub workspace: Option<String>,
     pub title: String,
     pub geometry: Geometry,
 }

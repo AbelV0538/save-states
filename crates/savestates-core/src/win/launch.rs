@@ -1,5 +1,7 @@
 //! Starting apps and arranging their windows.
 
+use std::ffi::{OsString, c_void};
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use windows::Win32::Foundation::{
@@ -60,22 +62,53 @@ pub fn spawn(exe: &Path, args: &[String], cwd: Option<&Path>) -> Result<u32, Lau
     let cwd = cwd.filter(|d| d.is_dir()).or_else(|| exe.parent());
     let exe_w = wide(exe);
     let cwd_w = cwd.map(wide);
+    let env = launch_environment(std::env::vars_os());
 
     let base = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT;
     // Break away from any job we were started in (terminals, IDEs), so restored apps
     // don't die with us; fall back if the job forbids breakaway.
-    match create_process(&exe_w, &cmdline, cwd_w.as_deref(), base | CREATE_BREAKAWAY_FROM_JOB) {
+    match create_process(&exe_w, &cmdline, cwd_w.as_deref(), &env, base | CREATE_BREAKAWAY_FROM_JOB) {
         Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
-            create_process(&exe_w, &cmdline, cwd_w.as_deref(), base).map_err(Into::into)
+            create_process(&exe_w, &cmdline, cwd_w.as_deref(), &env, base).map_err(Into::into)
         }
         other => other.map_err(Into::into),
     }
+}
+
+/// Our environment as a `CreateProcess` block, minus what makes a relaunched app misbehave:
+/// `ELECTRON_RUN_AS_NODE` turns any Electron app (VS Code included) into a windowless Node
+/// process, and `VSCODE_*` variables leak in when Save States was started from VS Code.
+/// The two VS Code reads that users set on purpose stay.
+pub(crate) fn launch_environment(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<u16> {
+    const KEEP: [&str; 2] = ["VSCODE_APPDATA", "VSCODE_EXTENSIONS"];
+    let mut vars: Vec<(OsString, OsString)> = vars
+        .into_iter()
+        .filter(|(k, _)| {
+            let k = k.to_string_lossy().to_ascii_uppercase();
+            k != "ELECTRON_RUN_AS_NODE" && (!k.starts_with("VSCODE_") || KEEP.contains(&k.as_str()))
+        })
+        .collect();
+    // The block must be sorted by name, ignoring case.
+    vars.sort_by_cached_key(|(k, _)| k.to_string_lossy().to_uppercase());
+    let mut block = Vec::new();
+    for (k, v) in &vars {
+        block.extend(k.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(v.encode_wide());
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 fn create_process(
     exe: &[u16],
     cmdline: &str,
     cwd: Option<&[u16]>,
+    env: &[u16],
     flags: PROCESS_CREATION_FLAGS,
 ) -> windows::core::Result<u32> {
     let mut cmd = wide(cmdline);
@@ -89,7 +122,7 @@ fn create_process(
             None,
             false,
             flags,
-            None,
+            Some(env.as_ptr() as *const c_void),
             cwd.map(pcwstr).unwrap_or(PCWSTR::null()),
             &si,
             &mut pi,
@@ -199,7 +232,23 @@ pub fn quote_arg(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::quote_arg;
+    use super::*;
+
+    #[test]
+    fn launch_environment_drops_vscode_and_electron_variables() {
+        let vars = [
+            ("Path", r"C:\x"),
+            ("ELECTRON_RUN_AS_NODE", "1"),
+            ("VSCODE_PID", "4"),
+            ("vscode_cwd", r"C:\"),
+            ("APPDATA", r"C:\a"),
+            ("VSCODE_APPDATA", r"D:\v"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let block = String::from_utf16(&launch_environment(vars)).unwrap();
+        assert_eq!(block, "APPDATA=C:\\a\0Path=C:\\x\0VSCODE_APPDATA=D:\\v\0\0");
+        assert_eq!(launch_environment([]), vec![0, 0]);
+    }
 
     #[test]
     fn quoting_follows_msvcrt_rules() {

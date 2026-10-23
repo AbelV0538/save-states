@@ -9,4 +9,5 @@ pub mod paths;
 pub mod restore;
 pub mod screenshot;
 pub mod store;
+pub mod vscode;
 pub mod win;

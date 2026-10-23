@@ -60,6 +60,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     "desktops": session.desktops,
                     "chrome_tabs_known": session.chrome_tabs_known,
                     "chrome_windows_without_tabs": session.chrome_windows_without_tabs,
+                    "vscode_windows_dropped": session.vscode_windows_dropped,
                     "items": items,
                 }))?
             );

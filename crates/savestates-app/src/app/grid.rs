@@ -342,6 +342,9 @@ fn describe(s: ItemSummary, scope: CaptureScope) -> String {
             windows
         });
     }
+    if s.vscode_windows > 0 {
+        parts.push(plural(s.vscode_windows, "VS Code window", "VS Code windows"));
+    }
     if parts.is_empty() {
         parts.push("Empty".into());
     }

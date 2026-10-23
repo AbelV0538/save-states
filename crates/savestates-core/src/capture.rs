@@ -1,5 +1,6 @@
 //! Capturing the live desktop: enumerate windows, classify each into the item it
-//! would be saved as, and attach Chrome tabs from the extension's snapshots.
+//! would be saved as, attach Chrome tabs from the extension's snapshots, and VS Code
+//! folders and workspaces from VS Code's own window state.
 //!
 //! The same classification feeds restore planning (to see what is already open), so
 //! [`collect`] is separate from [`capture`], which adds the screenshot and packaging.
@@ -17,11 +18,13 @@ use crate::chrome::{BridgeHub, ChromeEnv, ExtSnapshot, InstanceMap, snapshot};
 use crate::desktops;
 use crate::model::{
     CaptureScope, CapturedItem, ChromeTab, ChromeWindow, DesktopRef, ExplorerWindow, Geometry, ProcessWindow,
-    SaveState, StoredItem, TabGroup, Thumbnail, UwpWindow,
+    SaveState, StoredItem, TabGroup, Thumbnail, UwpWindow, VsCodeWindow,
 };
 use crate::paths::AppPaths;
 use crate::screenshot;
+use crate::vscode::{self, Match, WindowInfo};
 use crate::win::enumerate::{self, LiveWindow};
+use crate::win::process::CommandInfo;
 use crate::win::{explorer, process};
 
 pub struct CaptureContext<'a> {
@@ -45,6 +48,9 @@ pub struct LiveSession {
     pub chrome_tabs_known: bool,
     /// Chrome windows whose tabs could not be read (no extension / no match).
     pub chrome_windows_without_tabs: usize,
+    /// VS Code windows left out because they aren't main windows (developer tools,
+    /// floating editors, ...).
+    pub vscode_windows_dropped: usize,
 }
 
 /// Capture the current desktop into a new [`SaveState`]. Call from a thread with COM
@@ -115,6 +121,7 @@ pub fn collect(scope: CaptureScope, ctx: &CaptureContext<'_>) -> LiveSession {
         .into_iter()
         .collect();
     let commands = process::command_info(&process_pids);
+    let vscode = VsCodeWindows::resolve(&windows, &commands, &chrome);
 
     let mut items = Vec::with_capacity(windows.len());
     let mut seen_aumids: HashSet<String> = HashSet::new();
@@ -135,6 +142,11 @@ pub fn collect(scope: CaptureScope, ctx: &CaptureContext<'_>) -> LiveSession {
         } else if is_explorer_window(&w) {
             let folders = explorer_folders.get(&w.hwnd).cloned().unwrap_or_default();
             CapturedItem::Explorer(ExplorerWindow { folders, title: w.title.clone(), geometry: geom })
+        } else if vscode.dropped.contains(&w.hwnd) {
+            debug!(title = %w.title, "skipping an editor window that isn't a main window");
+            continue;
+        } else if let Some(v) = vscode.windows.get(&w.hwnd) {
+            CapturedItem::VsCode(VsCodeWindow { title: w.title.clone(), geometry: geom, ..v.clone() })
         } else {
             let Some(exe) = w.exe.clone() else {
                 debug!(title = %w.title, "skipping window whose process image is unreadable");
@@ -159,6 +171,7 @@ pub fn collect(scope: CaptureScope, ctx: &CaptureContext<'_>) -> LiveSession {
         desktops: desktop_list,
         chrome_tabs_known: chrome.tabs_known,
         chrome_windows_without_tabs: chrome.without_tabs,
+        vscode_windows_dropped: vscode.dropped.len(),
     }
 }
 
@@ -286,6 +299,85 @@ impl ChromeTabs {
             warn!("saving Chrome instance map: {e}");
         }
         Self { windows: out, tabs_known, without_tabs }
+    }
+}
+
+/// VS Code-family editor windows (by HWND) with the folder or workspace each shows.
+struct VsCodeWindows {
+    windows: HashMap<isize, VsCodeWindow>,
+    /// Editor windows that aren't main windows: developer tools, floating editors, ...
+    dropped: HashSet<isize>,
+}
+
+impl VsCodeWindows {
+    fn resolve(windows: &[LiveWindow], commands: &HashMap<u32, CommandInfo>, chrome: &ChromeTabs) -> Self {
+        let mut out = Self { windows: HashMap::new(), dropped: HashSet::new() };
+        // VS Code's window state belongs to a data directory, so group windows by that.
+        let mut products: HashMap<u32, Option<vscode::Product>> = HashMap::new();
+        let mut groups: Vec<(vscode::Product, Vec<&LiveWindow>)> = Vec::new();
+        for w in windows {
+            let Some(exe) = &w.exe else { continue };
+            if w.class != "Chrome_WidgetWin_1" || chrome.windows.contains_key(&w.hwnd) || process::is_packaged_path(exe)
+            {
+                continue;
+            }
+            let product = products.entry(w.pid).or_insert_with(|| {
+                let argv = commands.get(&w.pid).map(|c| c.argv.as_slice()).unwrap_or_default();
+                vscode::detect(exe, argv)
+            });
+            let Some(product) = product else { continue };
+            match groups.iter_mut().find(|(p, _)| p.data_dir == product.data_dir) {
+                Some((_, members)) => members.push(w),
+                None => groups.push((product.clone(), vec![w])),
+            }
+        }
+
+        for (product, members) in groups {
+            let Some(entries) = vscode::open_windows(&product.data_dir) else {
+                debug!(dir = %product.data_dir.display(), "no readable VS Code window state");
+                continue;
+            };
+            let infos: Vec<WindowInfo> = members
+                .iter()
+                .map(|w| WindowInfo {
+                    title: w.title.clone(),
+                    normal_rect: w.normal_rect,
+                    frame: w.frame,
+                    show: w.show,
+                    dpi: w.dpi,
+                })
+                .collect();
+            let Some(matches) = vscode::match_windows(&infos, &entries, &product.name) else {
+                // Most likely a custom `window.title`. Leave these windows to the plain-process
+                // path rather than guess.
+                warn!(product = %product.name, windows = members.len(), "no editor window matched VS Code's window state");
+                continue;
+            };
+            for (w, m) in members.iter().zip(matches) {
+                let entry = match m {
+                    Match::Entry(i) => &entries[i],
+                    Match::Auxiliary => {
+                        out.dropped.insert(w.hwnd);
+                        continue;
+                    }
+                    // Stays a plain process: there's no telling what it has open.
+                    Match::Unknown => {
+                        debug!(title = %w.title, "editor window missing from VS Code's window state");
+                        continue;
+                    }
+                };
+                let window = VsCodeWindow {
+                    exe: w.exe.clone().unwrap_or_default(),
+                    product: product.name.clone(),
+                    user_data_dir: product.user_data_dir_arg.clone(),
+                    folder: entry.folder.clone(),
+                    workspace: entry.workspace.clone(),
+                    ..Default::default()
+                };
+                out.windows.insert(w.hwnd, window);
+            }
+        }
+        out
     }
 }
 

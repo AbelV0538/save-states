@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
+use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, WAIT_OBJECT_0};
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    QueryFullProcessImageNameW, WaitForSingleObject,
 };
 use windows::core::PWSTR;
 
@@ -40,6 +42,16 @@ pub fn package_aumid(pid: u32) -> Option<String> {
         // `len` includes the terminating NUL.
         let s = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]);
         (!s.is_empty()).then_some(s)
+    }
+}
+
+/// Wait up to `timeout` for `pid` to exit. True if it has, or can't be watched (already gone).
+pub fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else { return true };
+        let r = WaitForSingleObject(h, timeout.as_millis().min(u32::MAX as u128) as u32);
+        let _ = CloseHandle(h);
+        r == WAIT_OBJECT_0
     }
 }
 

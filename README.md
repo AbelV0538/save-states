@@ -2,8 +2,9 @@
 
 Save what's open on your Windows desktop and come back to it later. A save state
 records which apps and windows are open, where they sit, which virtual desktop each is
-on, the folders open in File Explorer, and the tabs in every Chrome window, per Chrome
-profile. Loading a state reopens what's missing and puts each window back in place.
+on, the folders open in File Explorer, the folder or workspace in every VS Code window,
+and the tabs in every Chrome window, per Chrome profile. Loading a state reopens what's
+missing and puts each window back in place.
 
 Save States lives in the notification area. Its window exists only while it's open:
 closing it destroys the window and its GPU context, so the app costs almost nothing
@@ -77,6 +78,13 @@ extension (MV3)           pushes this profile's windows and tabs on every change
   "Profile 2"), so the profile comes straight from the HWND.
 - **Chrome tabs**: matched from extension snapshots to live windows by active-tab
   title plus DPI-scaled bounds.
+- **VS Code** (and Insiders, VSCodium, Cursor, or anything else built from it, found by
+  its `product.json`) records its open windows in `User\globalStorage\storage.json` and
+  rewrites that list whenever one of its windows loses focus, which clicking Save States
+  always causes. Each entry is paired with a live window by the folder or workspace name
+  in the window's title, with bounds breaking ties. Developer tools and floating editor
+  windows aren't in that list, so they're left out. On load, each folder or workspace
+  opens with `--new-window`, one at a time, and the new window is recognized by its title.
 - **Store apps** relaunch by AppUserModelID. **Explorer** windows reopen at their
   folders. **Other apps** relaunch from their executable, with only arguments that
   name an existing file or folder. Replaying full command lines is unsafe.
@@ -111,7 +119,8 @@ cargo test --workspace
 ```
 
 Unit tests cover the restore planner, Chrome window matching and profile mapping,
-the store's forward-compatibility, and framing. One integration test runs the real
+VS Code window state parsing and title matching, the store's forward-compatibility,
+and framing. One integration test runs the real
 bridge binary, plays the extension's side over its stdio, and checks every hop
 through the named pipe.
 
@@ -139,8 +148,11 @@ Environment variables: `SAVESTATES_HOME` (use a scratch data folder), `SAVESTATE
   restores Chrome's own last session alongside the saved one.
 - Incognito windows are never restored.
 - An app's internal state (unsaved documents, which project an editor had open) is
-  up to that app. Multi-window apps such as VS Code are launched once and restore
-  their own windows.
+  up to that app. Multi-window apps are launched once and restore their own windows.
+- VS Code windows are matched by the folder name in their titles. With a custom
+  `window.title` that leaves it out, VS Code is treated like any other multi-window app.
+  Unsaved editors come back through VS Code's own hot exit, and floating editor windows
+  aren't recreated.
 - Explorer tabs come back as separate windows; Windows has no API to open a tab.
 - Apps that need administrator rights are reported rather than triggering a UAC
   prompt mid-restore.

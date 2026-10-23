@@ -76,7 +76,7 @@ pub fn file_url_to_path(url: &str) -> Option<String> {
     (!decoded.is_empty()).then(|| decoded.replace('/', "\\"))
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     fn hex(b: u8) -> Option<u8> {
         (b as char).to_digit(16).map(|d| d as u8)
     }

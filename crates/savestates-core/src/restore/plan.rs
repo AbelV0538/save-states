@@ -4,8 +4,9 @@
 //!
 //! Matching rules:
 //! - ordinary apps launch once per distinct (exe, document args). Multi-window apps
-//!   like VS Code reopen their own windows, so three captured VS Code windows must
-//!   not become three launches; a still-running exe counts as already open;
+//!   reopen their own windows, so three captured windows of one exe must not become
+//!   three launches; a still-running exe counts as already open;
+//! - VS Code windows match one to one by folder or workspace, so each reopens on its own;
 //! - packaged/Store apps match by AppUserModelID;
 //! - Explorer matches per folder;
 //! - Chrome windows match within the same profile by tab-URL overlap (>= 60%).
@@ -18,6 +19,7 @@ use uuid::Uuid;
 use crate::capture::{LiveItem, LiveSession};
 use crate::chrome::normalize_url;
 use crate::model::{CaptureScope, CapturedItem, ChromeTab, DesktopRef, Geometry, SaveState, TabGroup};
+use crate::vscode;
 
 #[derive(Debug, Clone)]
 pub struct RestorePlan {
@@ -60,11 +62,18 @@ pub enum LaunchAction {
         tabs: Vec<ChromeTab>,
         groups: Vec<TabGroup>,
     },
+    VsCode {
+        exe: PathBuf,
+        user_data_dir: Option<PathBuf>,
+        folder: Option<String>,
+        workspace: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct ExtraWindow {
     pub hwnd: isize,
+    pub pid: u32,
     pub label: String,
 }
 
@@ -73,6 +82,7 @@ pub fn plan(state: &SaveState, live: &LiveSession) -> RestorePlan {
     let mut launches = Vec::new();
     let mut already_open = Vec::new();
 
+    plan_vscode(state, live, &mut used, &mut launches, &mut already_open);
     plan_processes(state, live, &mut used, &mut launches, &mut already_open);
 
     for item in state.known_items() {
@@ -140,6 +150,7 @@ pub fn plan(state: &SaveState, live: &LiveSession) -> RestorePlan {
                     });
                 }
             }
+            CapturedItem::VsCode(_) => {}  // handled by plan_vscode
             CapturedItem::Process(_) => {} // handled by plan_processes
         }
     }
@@ -149,7 +160,7 @@ pub fn plan(state: &SaveState, live: &LiveSession) -> RestorePlan {
         .iter()
         .zip(&used)
         .filter(|(li, used)| !**used && (state.scope == CaptureScope::AllDesktops || li.window.on_current_desktop))
-        .map(|(li, _)| ExtraWindow { hwnd: li.window.hwnd, label: li.item.label() })
+        .map(|(li, _)| ExtraWindow { hwnd: li.window.hwnd, pid: li.window.pid, label: li.item.label() })
         .collect();
 
     RestorePlan {
@@ -163,6 +174,46 @@ pub fn plan(state: &SaveState, live: &LiveSession) -> RestorePlan {
     }
 }
 
+/// Each saved VS Code window is one folder or workspace (or an empty window), open if one
+/// live window of the same editor shows it.
+fn plan_vscode(
+    state: &SaveState,
+    live: &LiveSession,
+    used: &mut [bool],
+    launches: &mut Vec<LaunchUnit>,
+    already_open: &mut Vec<String>,
+) {
+    for item in state.known_items() {
+        let CapturedItem::VsCode(v) = item else { continue };
+        let label = vscode::root_label(v.folder.as_deref(), v.workspace.as_deref());
+        let is_workspace = v.folder.is_none() && v.workspace.is_some();
+        let open = mark_first(live, used, |li| match &li.item {
+            CapturedItem::VsCode(l) => {
+                same_exe_name(&l.exe, &v.exe) && l.user_data_dir == v.user_data_dir && vscode::same_target(l, v)
+            }
+            // The live editor couldn't be read and fell back to a plain process: go by its titles.
+            CapturedItem::Process(l) => {
+                same_exe_name(&l.exe, &v.exe) && vscode::title_position(&l.title, &label, is_workspace).is_some()
+            }
+            _ => false,
+        });
+        if open {
+            already_open.push(item.label());
+        } else {
+            launches.push(LaunchUnit {
+                label: item.label(),
+                action: LaunchAction::VsCode {
+                    exe: v.exe.clone(),
+                    user_data_dir: v.user_data_dir.clone(),
+                    folder: v.folder.clone(),
+                    workspace: v.workspace.clone(),
+                },
+                windows: vec![(v.title.clone(), v.geometry.clone())],
+            });
+        }
+    }
+}
+
 fn plan_processes(
     state: &SaveState,
     live: &LiveSession,
@@ -170,10 +221,21 @@ fn plan_processes(
     launches: &mut Vec<LaunchUnit>,
     already_open: &mut Vec<String>,
 ) {
+    // An editor with saved VS Code windows reopens through those; launching it bare as well
+    // would only add an empty window.
+    let vscode_exes: Vec<&Path> = state
+        .known_items()
+        .filter_map(|i| match i {
+            CapturedItem::VsCode(v) => Some(v.exe.as_path()),
+            _ => None,
+        })
+        .collect();
     // Group saved windows by launch identity, keeping first-seen order.
     let mut groups: Vec<(String, Vec<String>, Vec<&crate::model::ProcessWindow>)> = Vec::new();
     for item in state.known_items() {
-        if let CapturedItem::Process(p) = item {
+        if let CapturedItem::Process(p) = item
+            && !vscode_exes.iter().any(|e| same_exe_name(e, &p.exe))
+        {
             let key = p.exe.to_string_lossy().to_ascii_lowercase();
             match groups.iter_mut().find(|(k, a, _)| *k == key && *a == p.args) {
                 Some((_, _, members)) => members.push(p),
@@ -184,12 +246,15 @@ fn plan_processes(
     for (_, args, members) in groups {
         let first = members[0];
         let doc_stem = args.first().and_then(|a| Path::new(a).file_stem()).map(|s| s.to_string_lossy().to_lowercase());
-        let open = mark_matching(live, used, |li| match &li.item {
-            CapturedItem::Process(l) => {
-                same_exe(&l.exe, &first.exe)
-                    && doc_stem.as_ref().is_none_or(|stem| l.title.to_lowercase().contains(stem.as_str()))
-            }
-            _ => false,
+        let open = mark_matching(live, used, |li| {
+            let (exe, title) = match &li.item {
+                CapturedItem::Process(l) => (&l.exe, &l.title),
+                // States saved before VS Code windows had their own kind hold the editor as a process.
+                CapturedItem::VsCode(l) => (&l.exe, &l.title),
+                _ => return false,
+            };
+            same_exe(exe, &first.exe)
+                && doc_stem.as_ref().is_none_or(|stem| title.to_lowercase().contains(stem.as_str()))
         });
         let label = CapturedItem::Process(first.clone()).label();
         if open {
@@ -245,14 +310,30 @@ fn mark_matching(live: &LiveSession, used: &mut [bool], pred: impl Fn(&LiveItem)
     any
 }
 
+/// Mark the first unused live item matching `pred`; true if there was one.
+fn mark_first(live: &LiveSession, used: &mut [bool], pred: impl Fn(&LiveItem) -> bool) -> bool {
+    let Some(i) = (0..live.items.len()).find(|&i| !used[i] && pred(&live.items[i])) else { return false };
+    used[i] = true;
+    true
+}
+
 fn same_exe(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+/// Same executable name, wherever it's installed (a per-user and a per-machine install of
+/// one editor are the same editor).
+fn same_exe_name(a: &Path, b: &Path) -> bool {
+    match (a.file_name(), b.file_name()) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChromeWindow, ExplorerWindow, ProcessWindow, StoredItem, UwpWindow};
+    use crate::model::{ChromeWindow, ExplorerWindow, ProcessWindow, StoredItem, UwpWindow, VsCodeWindow};
     use crate::win::enumerate::LiveWindow;
     use chrono::Utc;
 
@@ -304,6 +385,18 @@ mod tests {
             exe: exe.into(),
             title: title.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        })
+    }
+
+    const CODE: &str = r"C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe";
+
+    fn code(folder: Option<&str>, title: &str) -> CapturedItem {
+        CapturedItem::VsCode(VsCodeWindow {
+            exe: CODE.into(),
+            product: "Visual Studio Code".into(),
+            folder: folder.map(str::to_string),
+            title: title.into(),
             ..Default::default()
         })
     }
@@ -429,5 +522,69 @@ mod tests {
         let p = plan(&s, &l);
         assert!(p.launches.is_empty(), "{:?}", p.launches);
         assert_eq!(p.already_open.len(), 2);
+    }
+
+    #[test]
+    fn vscode_windows_match_one_to_one_by_folder() {
+        let a = "file:///c%3A/pers/research-mentor";
+        let s = state(
+            vec![
+                code(Some(a), "x - research-mentor - Visual Studio Code"),
+                code(Some("file:///c%3A/Users/me/saved_states"), "y - saved_states - Visual Studio Code"),
+            ],
+            CaptureScope::AllDesktops,
+        );
+
+        let p =
+            plan(&s, &live(vec![(code(Some("file:///C:/Users/me/saved_states/"), "z - Visual Studio Code"), true)]));
+        assert_eq!(p.already_open.len(), 1);
+        assert_eq!(p.launches.len(), 1);
+        assert!(matches!(&p.launches[0].action, LaunchAction::VsCode { folder: Some(f), .. } if f == a));
+        assert!(p.extras.is_empty());
+
+        // A window on another folder is not part of the state.
+        let p = plan(&s, &live(vec![(code(Some("file:///c%3A/other"), "other - Visual Studio Code"), true)]));
+        assert_eq!(p.launches.len(), 2);
+        assert_eq!(p.extras.len(), 1);
+    }
+
+    #[test]
+    fn empty_vscode_windows_match_one_to_one() {
+        let s = state(vec![code(None, ""), code(None, "")], CaptureScope::AllDesktops);
+        let p = plan(&s, &live(vec![(code(None, "Welcome - Visual Studio Code"), true)]));
+        assert_eq!(p.already_open.len(), 1);
+        assert_eq!(p.launches.len(), 1);
+    }
+
+    #[test]
+    fn states_from_before_vscode_items_still_count_a_running_editor() {
+        let s = state(vec![proc_(CODE, "a - Visual Studio Code", &[])], CaptureScope::AllDesktops);
+        let l = live(vec![
+            (code(Some("file:///c%3A/a"), "x - a - Visual Studio Code"), true),
+            (code(None, "Welcome - Visual Studio Code"), true),
+        ]);
+        let p = plan(&s, &l);
+        assert!(p.launches.is_empty());
+        assert_eq!(p.already_open.len(), 1);
+        assert!(p.extras.is_empty(), "every window of the running editor belongs to the state");
+    }
+
+    #[test]
+    fn saved_vscode_windows_replace_a_bare_launch_of_the_editor() {
+        let s = state(
+            vec![code(Some("file:///c%3A/a"), "a - Visual Studio Code"), proc_(CODE, "b - Visual Studio Code", &[])],
+            CaptureScope::AllDesktops,
+        );
+        let p = plan(&s, &live(vec![]));
+        assert_eq!(p.launches.len(), 1);
+        assert!(matches!(p.launches[0].action, LaunchAction::VsCode { .. }));
+    }
+
+    #[test]
+    fn a_saved_folder_is_found_in_a_live_editor_read_as_a_process() {
+        let s = state(vec![code(Some("file:///c%3A/x/proj"), "")], CaptureScope::AllDesktops);
+        let p = plan(&s, &live(vec![(proc_(CODE, "main.rs - proj - Visual Studio Code", &[]), true)]));
+        assert!(p.launches.is_empty());
+        assert!(p.extras.is_empty());
     }
 }
